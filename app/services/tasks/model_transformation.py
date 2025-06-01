@@ -8,14 +8,211 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import json
+from pathlib import Path
 
 from app.services.ai.model_enhancement_service import ModelEnhancementService
 from app.services.ai.garment_optimization_service import GarmentOptimizationService
 from app.services.ai.scene_generation_service import SceneGenerationService
-from app.utils.image_utils import resize_image, enhance_image
+from app.utils.image_utils import resize_image, enhance_image, load_image, save_image
 from app.core.config import settings
+from app.services.celery_app import celery_app
+from app.models.schemas import ModelTransformationRequest # Assuming this schema is used
 
 logger = logging.getLogger(__name__)
+
+# Helper function for updating status (adapted from endpoint)
+# Made synchronous for now, as Celery tasks are often synchronous.
+# If Celery task is async, this can remain async.
+def _update_transformation_status_sync(
+    transformation_id: str,
+    status: str,
+    progress: int,
+    message: str,
+    result_data: Optional[Dict[str, Any]] = None
+):
+    """Update transformation status synchronously"""
+    try:
+        status_data = {
+            "transformation_id": transformation_id,
+            "status": status,
+            "progress": progress,
+            "message": message,
+            "updated_at": time.time(),
+            "created_at": time.time()  # Will be overwritten if file exists
+        }
+
+        if result_data:
+            status_data["result"] = result_data
+
+        # Load existing status to preserve created_at
+        status_file = Path(settings.OUTPUT_DIR) / f"{transformation_id}_status.json"
+        if status_file.exists():
+            try:
+                with open(status_file, 'r') as f:
+                    existing_data = json.load(f)
+                status_data["created_at"] = existing_data.get("created_at", time.time())
+            except json.JSONDecodeError as e: # More specific error
+                logger.error(f"Error decoding JSON from existing status file {status_file} for task {transformation_id}: {e}", exc_info=True)
+            except IOError as e:
+                logger.error(f"IOError reading existing status file {status_file} for task {transformation_id}: {e}", exc_info=True)
+            except Exception as e: # Catch any other unexpected error
+                logger.error(f"Unexpected error reading existing status file {status_file} for task {transformation_id}: {e}", exc_info=True)
+
+        # Save status
+        status_file.parent.mkdir(parents=True, exist_ok=True) # This is fine
+        with open(status_file, 'w') as f:
+            json.dump(status_data, f, indent=2, default=str) # default=str is good for non-serializable like datetime or Path
+
+    except IOError as e:
+        logger.error(f"IOError updating transformation status file for {transformation_id} at {status_file}: {e}", exc_info=True)
+    except Exception as e: # Catch any other unexpected error
+        logger.error(f"Unexpected error updating transformation status for {transformation_id}: {e}", exc_info=True)
+
+
+# Global pipeline instance - consider if this is appropriate for Celery workers
+# Each worker process might get its own instance.
+# If models are large, loading them per task/worker can be resource-intensive.
+# A shared, pre-loaded instance might be better if managed carefully.
+# For now, let's assume it's loaded on worker startup or first task.
+_pipeline_instance = None
+_pipeline_lock = threading.Lock()
+
+def get_transformation_pipeline():
+    """Gets a thread-safe instance of the pipeline, loading models if necessary."""
+    global _pipeline_instance
+    if _pipeline_instance is None:
+        with _pipeline_lock:
+            if _pipeline_instance is None:
+                logger.info("Initializing ModelTransformationPipeline for Celery worker...")
+                temp_pipeline = ModelTransformationPipeline()
+                try:
+                    temp_pipeline.load_all_models()
+                    _pipeline_instance = temp_pipeline
+                    logger.info("ModelTransformationPipeline loaded successfully for Celery worker.")
+                except Exception as e: # Catch any exception during pipeline init or model loading
+                    logger.error(f"Failed to initialize or load transformation pipeline for Celery worker: {e}", exc_info=True)
+                    # Decide if we should raise an error or allow tasks to fail if pipeline is not loaded
+                    raise # Raising error to prevent tasks from running with an uninitialized pipeline
+    return _pipeline_instance
+
+
+@celery_app.task(name="model_transformation.transform_model_task")
+def transform_model_task(
+    transformation_id: str,
+    request_data_dict: dict  # Pass dict instead of Pydantic model
+):
+    """Celery task for processing model transformation"""
+    logger.info(f"Celery task started for transformation_id: {transformation_id}")
+
+    # Recreate ModelTransformationRequest from dict
+    request_data = ModelTransformationRequest(**request_data_dict)
+
+    try:
+        pipeline = get_transformation_pipeline()
+        if not pipeline.services_loaded:
+            logger.warning(f"Pipeline models not loaded for task {transformation_id}. Attempting to load now.")
+            pipeline.load_all_models() # Attempt to load again if not loaded.
+            if not pipeline.services_loaded:
+                raise Exception("Pipeline models could not be loaded.")
+
+        # Update status to processing
+        _update_transformation_status_sync(
+            transformation_id,
+            "processing",
+            0,
+            "Starting model transformation via Celery..."
+        )
+
+        # Load input image using the file path from request_data
+        logger.info(f"Loading input image from: {request_data.input_file_path}")
+        input_image = load_image(request_data.input_file_path) # Assuming load_image is available
+        if input_image is None: # load_image should ideally raise an error if it fails
+            logger.error(f"Failed to load image from path: {request_data.input_file_path} for task {transformation_id}")
+            raise ValueError(f"Could not load image from path: {request_data.input_file_path}")
+
+        # Process transformation
+        logger.info(f"Calling pipeline.transform_model for transformation_id: {transformation_id} with quality_mode: {request_data.quality_mode}")
+        result = pipeline.transform_model(
+            transformation_id=transformation_id, # Pass transformation_id to the pipeline method
+            model_image=input_image,
+            style_prompt=request_data.style_prompt,
+            negative_prompt=request_data.negative_prompt,
+            num_variations=request_data.num_variations,
+            enhance_model=request_data.enhance_model,
+            optimize_garment=request_data.optimize_garment,
+            generate_scene=request_data.generate_scene,
+            quality_mode=request_data.quality_mode,
+            seed=request_data.seed
+        )
+
+        # Save variation images
+        output_dir = Path(settings.OUTPUT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_variations = []
+        if result.get("variations"):
+            for i, variation_data in enumerate(result["variations"]):
+                variation_path = output_dir / f"{transformation_id}_variation_{i}.jpg"
+
+                # Ensure 'variation_image' key exists and contains a PIL Image
+                pil_image = variation_data.get("variation_image")
+                if not isinstance(pil_image, Image.Image):
+                    logger.error(f"Variation {i} for {transformation_id} is not a PIL image, skipping save.")
+                    continue
+
+                save_success = save_image(pil_image, str(variation_path)) # Assuming save_image is available
+
+                if save_success:
+                    saved_variations.append({
+                        "index": i,
+                        "style_type": variation_data.get("style_type", "unknown"),
+                        "file_path": str(variation_path),
+                        "quality_score": variation_data.get("quality_score", 0.0),
+                        "download_url": f"/api/v1/download-variation/{transformation_id}/{i}" # Adjust API path if needed
+                    })
+                else:
+                    logger.warning(f"Failed to save variation {i} for {transformation_id}")
+        else:
+            logger.warning(f"No variations found in result for {transformation_id}")
+
+        # Save complete result
+        result_data_to_save = {
+            "transformation_id": transformation_id,
+            "status": "completed",
+            "variations": saved_variations,
+            "metadata": result.get("metadata", {}),
+            "quality_scores": result.get("quality_scores", {}),
+            "performance_metrics": result.get("performance_metrics", {}),
+            "request_data": request_data.dict()
+        }
+
+        result_file = output_dir / f"{transformation_id}_result.json"
+        with open(result_file, 'w') as f:
+            json.dump(result_data_to_save, f, indent=2, default=str)
+
+        # Update final status
+        _update_transformation_status_sync(
+            transformation_id,
+            "completed",
+            100,
+            "Transformation completed successfully via Celery",
+            result_data_to_save # Pass the saved result data
+        )
+        logger.info(f"Celery task completed successfully for transformation_id: {transformation_id}")
+        return result_data_to_save # Return the final result
+
+    except Exception as e:
+        logger.error(f"Celery transformation task failed for {transformation_id}: {e}", exc_info=True)
+        _update_transformation_status_sync(
+            transformation_id,
+            "failed",
+            0,
+            f"Transformation failed in Celery: {str(e)}"
+        )
+        # Optionally, re-raise to mark the task as failed in Celery
+        raise # This will make Celery record the task as FAILED
+
 
 class ModelTransformationPipeline:
     """Complete pipeline for transforming model photos into professional photoshoots"""
@@ -109,22 +306,31 @@ class ModelTransformationPipeline:
                 for future in as_completed(futures):
                     service_name = futures[future]
                     try:
-                        future.result()
-                        logger.info(f"{service_name} service loaded successfully")
+                        future.result() # Wait for the specific service to load
+                        logger.info(f"'{service_name}' service loaded successfully.")
                     except Exception as e:
-                        logger.error(f"Failed to load {service_name} service: {e}")
-            
+                        logger.error(f"Failed to load '{service_name}' service during parallel loading: {e}", exc_info=True)
+                        # Optionally, re-raise or collect errors to decide if pipeline is usable
+
+            # Check if all services actually loaded if individual errors don't halt execution
+            # This depends on how robust each service's load_models() is.
+            # For now, assume if no exception bubbles up from futures, it's loaded.
             self.services_loaded = True
-            logger.info("All transformation pipeline models loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load pipeline models: {str(e)}")
-            # Use fallback mode
-            self.services_loaded = True
-            logger.info("Pipeline running in fallback mode")
+            logger.info("Finished attempting to load all transformation pipeline models.")
+
+        except Exception as e: # Catch error from ThreadPoolExecutor or other unexpected issues
+            logger.error(f"An error occurred during the parallel loading of pipeline models: {e}", exc_info=True)
+            # Decide on services_loaded state based on requirements.
+            # If any model failing is critical, set self.services_loaded = False
+            # Or rely on individual services' loaded status.
+            # For now, current logic is to try to run in a fallback mode.
+            self.services_loaded = False # Or true if some services might have loaded and fallback is desired
+            logger.warning("Pipeline model loading process encountered an error. Status set to not fully loaded.")
+            # raise # Optionally re-raise if this is critical
     
     def transform_model(
         self,
+        transformation_id: str, # Added for logging context
         model_image: Image.Image,
         style_prompt: str,
         negative_prompt: str = "",
@@ -133,314 +339,320 @@ class ModelTransformationPipeline:
         optimize_garment: bool = True,
         generate_scene: bool = True,
         quality_mode: str = "balanced",  # "fast", "balanced", "high"
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Transform model photo into professional photoshoot variations
-        
-        Args:
-            model_image: Input model image
-            style_prompt: Overall style description
-            negative_prompt: What to avoid
-            num_variations: Number of style variations to generate
-            enhance_model: Whether to enhance model appearance
-            optimize_garment: Whether to optimize garment
-            generate_scene: Whether to generate professional scenes
-            quality_mode: Processing quality mode
-            seed: Random seed for reproducibility
-            
-        Returns:
-            Transformation results with variations and metadata
+        Transform model photo into professional photoshoot variations.
         """
+        start_time = time.time()
+        # Use the transformation_id passed from the Celery task for consistent logging
+        logger.info(
+            f"Starting model transformation for ID: {transformation_id}. "
+            f"Params: Style='{style_prompt[:50]}...', Variations={num_variations}, EnhanceModel={enhance_model}, "
+            f"OptimizeGarment={optimize_garment}, GenerateScene={generate_scene}, Quality={quality_mode}, Seed={seed}."
+        )
+
         try:
-            start_time = time.time()
-            transformation_id = str(uuid.uuid4())
-            
-            logger.info(f"Starting model transformation {transformation_id}")
-            
-            # Ensure models are loaded
             if not self.services_loaded:
-                self.load_all_models()
-            
-            # Set random seed if provided
+                logger.warning(f"[{transformation_id}] Services not pre-loaded. Attempting to load now.")
+                self.load_all_models() # Load models if they weren't loaded at startup/worker init
+                if not self.services_loaded: # Check again after attempting load
+                    logger.error(f"[{transformation_id}] Critical: Services still not loaded after attempt. Aborting transformation.")
+                    # This should ideally not happen if load_all_models raises on critical failure
+                    return self._create_fallback_result(model_image, num_variations, "Core services failed to load.", transformation_id)
+
             if seed is not None:
+                logger.debug(f"[{transformation_id}] Setting random seed to: {seed}")
                 torch.manual_seed(seed)
                 np.random.seed(seed)
             
-            # Validate and preprocess input
-            processed_image = self._preprocess_input(model_image, quality_mode)
+            logger.debug(f"[{transformation_id}] Preprocessing input image. Original size: {model_image.size}, Mode: {model_image.mode}")
+            processed_image = self._preprocess_input(model_image, quality_mode, transformation_id)
             
-            # Track processing stages
             stage_times = {}
             stage_results = {}
             error_handling = {"fallbacks_used": 0, "errors": []}
             
+            current_image_state = processed_image # Keep track of the image as it's processed
+
             # Stage 1: Model Enhancement
             if enhance_model:
-                stage_start = time.time()
+                logger.info(f"[{transformation_id}] Starting model enhancement stage.")
+                stage_start_time = time.time()
                 try:
-                    enhancement_result = self.enhance_model_step(processed_image)
-                    processed_image = enhancement_result["enhanced_image"]
+                    enhancement_result = self.enhance_model_step(current_image_state, transformation_id)
+                    current_image_state = enhancement_result["enhanced_image"]
                     stage_results["model_enhancement"] = enhancement_result
-                    stage_times["model_enhancement"] = time.time() - stage_start
                 except Exception as e:
-                    logger.error(f"Model enhancement failed: {e}")
+                    logger.error(f"[{transformation_id}] Model enhancement stage failed: {e}", exc_info=True)
                     error_handling["fallbacks_used"] += 1
                     error_handling["errors"].append(f"Model enhancement: {str(e)}")
-                    stage_times["model_enhancement"] = time.time() - stage_start
-            
+                stage_times["model_enhancement"] = time.time() - stage_start_time
+                logger.info(f"[{transformation_id}] Model enhancement stage completed in {stage_times['model_enhancement']:.2f}s.")
+
             # Stage 2: Garment Optimization
             if optimize_garment:
-                stage_start = time.time()
+                logger.info(f"[{transformation_id}] Starting garment optimization stage.")
+                stage_start_time = time.time()
                 try:
-                    garment_result = self.optimize_garment_step(processed_image)
-                    processed_image = garment_result["optimized_image"]
+                    garment_result = self.optimize_garment_step(current_image_state, transformation_id)
+                    current_image_state = garment_result["optimized_image"]
                     stage_results["garment_optimization"] = garment_result
-                    stage_times["garment_optimization"] = time.time() - stage_start
                 except Exception as e:
-                    logger.error(f"Garment optimization failed: {e}")
+                    logger.error(f"[{transformation_id}] Garment optimization stage failed: {e}", exc_info=True)
                     error_handling["fallbacks_used"] += 1
                     error_handling["errors"].append(f"Garment optimization: {str(e)}")
-                    stage_times["garment_optimization"] = time.time() - stage_start
+                stage_times["garment_optimization"] = time.time() - stage_start_time
+                logger.info(f"[{transformation_id}] Garment optimization stage completed in {stage_times['garment_optimization']:.2f}s.")
             
             # Stage 3: Generate Style Variations
             variations = []
             variation_times = []
-            
             if num_variations > 0:
-                # Get style configurations
-                style_types = list(self.style_configs.keys())[:num_variations]
+                logger.info(f"[{transformation_id}] Starting style variation generation for {num_variations} variations.")
+                style_types = list(self.style_configs.keys())[:num_variations] # Determine styles to generate
                 
-                # Generate variations
                 if quality_mode == "fast":
-                    # Sequential processing for fast mode
+                    logger.info(f"[{transformation_id}] Generating variations sequentially (quality_mode: {quality_mode}).")
                     variations = self._generate_variations_sequential(
-                        processed_image, style_prompt, negative_prompt, style_types, generate_scene
+                        current_image_state, style_prompt, negative_prompt, style_types, generate_scene, transformation_id
                     )
                 else:
-                    # Parallel processing for balanced/high quality
+                    logger.info(f"[{transformation_id}] Generating variations in parallel (quality_mode: {quality_mode}).")
                     variations = self._generate_variations_parallel(
-                        processed_image, style_prompt, negative_prompt, style_types, generate_scene
+                        current_image_state, style_prompt, negative_prompt, style_types, generate_scene, transformation_id
                     )
-                
-                variation_times = [v.get("processing_time", 0) for v in variations]
+                variation_times = [v.get("processing_time", 0.0) for v in variations]
+                logger.info(f"[{transformation_id}] Finished generating {len(variations)} variations.")
             
-            # Calculate quality scores
-            quality_scores = self._calculate_quality_scores(variations, stage_results)
+            logger.debug(f"[{transformation_id}] Calculating quality scores.")
+            quality_scores = self._calculate_quality_scores(variations, stage_results, transformation_id)
             
-            # Update processing stats
-            total_time = time.time() - start_time
-            self._update_processing_stats(total_time, quality_scores["overall_average"])
+            total_processing_time = time.time() - start_time
+            logger.debug(f"[{transformation_id}] Updating processing stats.")
+            self._update_processing_stats(total_processing_time, quality_scores.get("overall_average", 0.0), transformation_id)
             
-            # Compile final result
-            result = {
-                "transformation_id": transformation_id,
+            final_result = {
+                "transformation_id": transformation_id, # Ensure this is the one from Celery task
                 "variations": variations,
                 "metadata": {
                     "original_image_size": model_image.size,
                     "processing_stages": list(stage_results.keys()),
-                    "stage_times": stage_times,
-                    "variation_times": variation_times,
-                    "total_processing_time": total_time,
+                    "stage_times": {k: round(v, 2) for k, v in stage_times.items()}, # Rounded times
+                    "variation_times": [round(vt, 2) for vt in variation_times], # Rounded times
+                    "total_processing_time": round(total_processing_time, 2),
                     "quality_mode": quality_mode,
                     "num_variations_requested": num_variations,
                     "num_variations_generated": len(variations),
-                    "seed": seed
+                    "seed_used": seed # Renamed from "seed" for clarity that it's the one used
                 },
                 "quality_scores": quality_scores,
                 "performance_metrics": {
-                    "meets_time_target": total_time <= self.performance_targets["total_pipeline"],
-                    "meets_quality_target": quality_scores["overall_average"] >= self.quality_thresholds["minimum_acceptable"],
-                    "efficiency_score": self._calculate_efficiency_score(total_time, quality_scores["overall_average"])
+                    "meets_time_target": total_processing_time <= self.performance_targets["total_pipeline"],
+                    "meets_quality_target": quality_scores.get("overall_average", 0.0) >= self.quality_thresholds["minimum_acceptable"],
+                    "efficiency_score": self._calculate_efficiency_score(total_processing_time, quality_scores.get("overall_average", 0.0), transformation_id)
                 },
                 "error_handling": error_handling,
-                "stage_results": stage_results
+                # "stage_results": stage_results # Optional: can be large, include if needed for debug/client
             }
             
-            logger.info(f"Transformation {transformation_id} completed in {total_time:.2f}s")
-            return result
+            logger.info(f"Transformation {transformation_id} completed successfully in {total_processing_time:.2f}s.")
+            return final_result
             
         except Exception as e:
-            logger.error(f"Model transformation pipeline failed: {str(e)}")
-            return self._create_fallback_result(model_image, num_variations, str(e))
+            # This is a critical failure for the entire pipeline
+            logger.error(f"Model transformation pipeline failed critically for ID {transformation_id}: {e}", exc_info=True)
+            return self._create_fallback_result(model_image, num_variations, str(e), transformation_id)
     
-    def enhance_model_step(self, image: Image.Image) -> Dict[str, Any]:
+    def enhance_model_step(self, image: Image.Image, transformation_id: str) -> Dict[str, Any]: # Added transformation_id
         """Execute model enhancement step"""
+        logger.debug(f"[{transformation_id}] Enhancing model...")
         try:
             start_time = time.time()
             
-            # Run model enhancement
-            enhancement_result = self.model_enhancement_service.enhance_model(image)
+            enhancement_result = self.model_enhancement_service.enhance_model(image) # Assuming this service has its own logging
             
-            # Calculate quality improvement
-            original_quality = self.assess_image_quality(image)
-            enhanced_quality = self.assess_image_quality(enhancement_result["enhanced_image"])
+            original_quality = self.assess_image_quality(image, transformation_id, "original_for_enhancement") # Pass ID
+            enhanced_quality = self.assess_image_quality(enhancement_result["enhanced_image"], transformation_id, "after_enhancement") # Pass ID
             quality_improvement = enhanced_quality - original_quality
             
+            processing_time = time.time() - start_time
+            logger.debug(f"[{transformation_id}] Model enhancement finished in {processing_time:.2f}s. Quality improvement: {quality_improvement:.2f}")
             return {
                 "enhanced_image": enhancement_result["enhanced_image"],
                 "enhancement_metadata": enhancement_result,
                 "quality_improvement": quality_improvement,
-                "processing_time": time.time() - start_time
+                "processing_time": processing_time,
+                "error_occurred": False
             }
             
         except Exception as e:
-            logger.error(f"Model enhancement step failed: {e}")
+            logger.error(f"[{transformation_id}] Model enhancement step failed: {e}", exc_info=True)
             return {
                 "enhanced_image": image,
-                "enhancement_metadata": {"error": str(e)},
+                "enhancement_metadata": {"error": str(e), "details": "Model enhancement service failed."},
                 "quality_improvement": 0.0,
-                "processing_time": 0.0
+                "processing_time": time.time() - start_time,
+                "error_occurred": True
             }
     
-    def optimize_garment_step(self, image: Image.Image) -> Dict[str, Any]:
+    def optimize_garment_step(self, image: Image.Image, transformation_id: str) -> Dict[str, Any]: # Added transformation_id
         """Execute garment optimization step"""
+        logger.debug(f"[{transformation_id}] Optimizing garment...")
         try:
             start_time = time.time()
             
-            # Run garment optimization
-            optimization_result = self.garment_optimization_service.optimize_garment(image)
+            optimization_result = self.garment_optimization_service.optimize_garment(image) # Service should log internally
             
+            processing_time = time.time() - start_time
+            logger.debug(f"[{transformation_id}] Garment optimization finished in {processing_time:.2f}s. Score: {optimization_result.get('overall_score', 'N/A')}")
             return {
                 "optimized_image": optimization_result["optimized_image"],
                 "optimization_metadata": optimization_result,
-                "garment_quality_score": optimization_result["overall_score"],
-                "processing_time": time.time() - start_time
+                "garment_quality_score": optimization_result.get("overall_score", 5.0),
+                "processing_time": processing_time,
+                "error_occurred": False
             }
             
         except Exception as e:
-            logger.error(f"Garment optimization step failed: {e}")
+            logger.error(f"[{transformation_id}] Garment optimization step failed: {e}", exc_info=True)
             return {
                 "optimized_image": image,
-                "optimization_metadata": {"error": str(e)},
-                "garment_quality_score": 5.0,
-                "processing_time": 0.0
+                "optimization_metadata": {"error": str(e), "details": "Garment optimization service failed."},
+                "garment_quality_score": 0.0,
+                "processing_time": time.time() - start_time,
+                "error_occurred": True
             }
     
     def generate_scene_step(
         self,
         image: Image.Image,
         style_prompt: str,
-        background_type: str
+        background_type: str,
+        transformation_id: str # Added transformation_id
     ) -> Dict[str, Any]:
         """Execute scene generation step"""
+        logger.debug(f"[{transformation_id}] Generating scene. Style: '{style_prompt[:30]}...', Background: {background_type}")
         try:
             start_time = time.time()
             
-            # Generate scene
             scene_result = self.scene_generation_service.compose_scene(
                 model_image=image,
                 background_type=background_type,
-                composition_style=self._extract_composition_style(style_prompt)
+                composition_style=self._extract_composition_style(style_prompt, transformation_id) # Pass ID
             )
             
-            # Apply lighting
             lighting_result = self.scene_generation_service.apply_lighting(
                 scene_result["composed_scene"],
-                lighting_type=self._extract_lighting_type(style_prompt)
+                lighting_type=self._extract_lighting_type(style_prompt, transformation_id) # Pass ID
             )
             
             final_scene = lighting_result["lit_image"]
-            scene_quality = (scene_result["composition_score"] + lighting_result["lighting_quality"] * 10) / 2
+            comp_score = scene_result.get("composition_score", 0.0)
+            light_qual = lighting_result.get("lighting_quality", 0.0)
+            scene_quality = (comp_score + light_qual * 10) / 2.0
             
+            processing_time = time.time() - start_time
+            logger.debug(f"[{transformation_id}] Scene generation finished in {processing_time:.2f}s. Quality: {scene_quality:.2f}")
             return {
                 "scene_image": final_scene,
-                "scene_metadata": {
-                    "composition_result": scene_result,
-                    "lighting_result": lighting_result
-                },
+                "scene_metadata": {"composition_result": scene_result, "lighting_result": lighting_result},
                 "scene_quality_score": scene_quality,
-                "processing_time": time.time() - start_time
+                "processing_time": processing_time,
+                "error_occurred": False
             }
             
         except Exception as e:
-            logger.error(f"Scene generation step failed: {e}")
+            logger.error(f"[{transformation_id}] Scene generation step failed: {e}", exc_info=True)
             return {
                 "scene_image": image,
-                "scene_metadata": {"error": str(e)},
-                "scene_quality_score": 5.0,
-                "processing_time": 0.0
+                "scene_metadata": {"error": str(e), "details": "Scene generation service failed."},
+                "scene_quality_score": 0.0,
+                "processing_time": time.time() - start_time,
+                "error_occurred": True
             }
     
     def generate_style_variation(
         self,
         image: Image.Image,
         style_config: Dict[str, Any],
-        variation_name: str
+        variation_name: str,
+        transformation_id: str # Added transformation_id
     ) -> Dict[str, Any]:
         """Generate a single style variation"""
+        logger.debug(f"[{transformation_id}] Generating style variation: {variation_name}")
         try:
             start_time = time.time()
             
-            # Apply style-specific enhancements
-            enhanced_image = self._apply_style_enhancements(image, style_config)
+            enhanced_image = self._apply_style_enhancements(image, style_config, transformation_id) # Pass ID
             
-            # Generate scene if needed
+            scene_quality = 8.0 # Default for no scene generation
             if style_config.get("background_type"):
-                scene_result = self.generate_scene_step(
-                    enhanced_image,
-                    style_config["style_prompt"],
-                    style_config["background_type"]
+                logger.debug(f"[{transformation_id}] Variation '{variation_name}' requires scene generation.")
+                scene_result = self.generate_scene_step( # Pass transformation_id
+                    enhanced_image, style_config["style_prompt"], style_config["background_type"], transformation_id
                 )
-                final_image = scene_result["scene_image"]
-                scene_quality = scene_result["scene_quality_score"]
+                if scene_result.get("error_occurred"): # Check if sub-step failed
+                    logger.warning(f"[{transformation_id}] Scene generation failed for variation '{variation_name}'. Using enhanced image without new scene.")
+                    final_image = enhanced_image # Use image before scene attempt
+                else:
+                    final_image = scene_result["scene_image"]
+                    scene_quality = scene_result["scene_quality_score"]
             else:
                 final_image = enhanced_image
-                scene_quality = 8.0  # Default for no scene generation
+                logger.debug(f"[{transformation_id}] Variation '{variation_name}' does not require scene generation.")
+
+            style_consistency = self._assess_style_consistency(final_image, style_config, transformation_id) # Pass ID
+            quality_score = self.assess_image_quality(final_image, transformation_id, f"variation_{variation_name}") # Pass ID
             
-            # Calculate style consistency
-            style_consistency = self._assess_style_consistency(final_image, style_config)
-            
-            # Calculate overall quality
-            quality_score = self.assess_image_quality(final_image)
-            
+            processing_time = time.time() - start_time
+            logger.info(f"[{transformation_id}] Style variation '{variation_name}' generated in {processing_time:.2f}s. Quality: {quality_score:.2f}")
             return {
                 "variation_image": final_image,
                 "style_type": variation_name,
                 "style_consistency": style_consistency,
                 "quality_score": quality_score,
                 "scene_quality": scene_quality,
-                "processing_time": time.time() - start_time,
-                "style_config_used": style_config
+                "processing_time": processing_time,
+                "style_config_used": style_config,
+                "error_occurred": False
             }
             
         except Exception as e:
-            logger.error(f"Style variation generation failed: {e}")
+            logger.error(f"[{transformation_id}] Style variation generation for '{variation_name}' failed: {e}", exc_info=True)
             return {
                 "variation_image": image,
                 "style_type": variation_name,
-                "style_consistency": 0.7,
-                "quality_score": 5.0,
-                "scene_quality": 5.0,
-                "processing_time": 0.0,
-                "error": str(e)
+                "style_consistency": 0.0,
+                "quality_score": 0.0,
+                "scene_quality": 0.0,
+                "processing_time": time.time() - start_time,
+                "error": str(e),
+                "error_occurred": True
             }
     
-    def _preprocess_input(self, image: Image.Image, quality_mode: str) -> Image.Image:
-        """Preprocess input image based on quality mode"""
+    def _preprocess_input(self, image: Image.Image, quality_mode: str, transformation_id: str) -> Image.Image: # Added transformation_id
+        """Preprocess input image based on quality mode."""
+        logger.debug(f"[{transformation_id}] Preprocessing input. Quality mode: {quality_mode}")
         try:
-            processed = image.copy()
+            processed_image = image.copy()
             
-            # Resize based on quality mode
-            if quality_mode == "fast":
-                max_size = 512
-            elif quality_mode == "balanced":
-                max_size = 1024
-            else:  # high quality
-                max_size = 2048
+            resize_thresholds = {"fast": 512, "balanced": 1024, "high": 2048}
+            max_size = resize_thresholds.get(quality_mode, 1024)
             
-            # Resize if needed
-            if max(processed.size) > max_size:
-                processed = resize_image(processed, max_size)
+            if max(processed_image.size) > max_size:
+                logger.debug(f"[{transformation_id}] Resizing image from {processed_image.size} to max_size {max_size}.")
+                processed_image = resize_image(processed_image, max_size)
             
-            # Basic enhancement
             if quality_mode in ["balanced", "high"]:
-                processed = enhance_image(processed, brightness=1.05, contrast=1.05)
+                logger.debug(f"[{transformation_id}] Applying basic enhancement for quality mode '{quality_mode}'.")
+                processed_image = enhance_image(processed_image, brightness=1.05, contrast=1.05)
             
-            return processed
+            logger.info(f"[{transformation_id}] Input preprocessing completed. New size: {processed_image.size}")
+            return processed_image
             
         except Exception as e:
-            logger.error(f"Input preprocessing failed: {e}")
+            logger.error(f"[{transformation_id}] Input preprocessing failed: {e}", exc_info=True)
             return image
     
     def _generate_variations_sequential(

@@ -8,6 +8,15 @@ from pathlib import Path
 
 from app.api.endpoints import image_processing, health
 from app.core.config import settings
+from app.utils.logging_config import setup_logging # Import setup_logging
+
+# Initialize logging
+# Use log file from settings if available, otherwise default.
+# Use log level from settings if available, otherwise default to INFO.
+log_file_path = getattr(settings, "LOG_FILE", "logs/app.log")
+log_level = getattr(settings, "LOG_LEVEL", "INFO")
+setup_logging(log_level=log_level, log_file=log_file_path)
+
 
 app = FastAPI(
     title="Garment Creative AI",

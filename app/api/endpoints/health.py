@@ -2,8 +2,10 @@ from fastapi import APIRouter, Depends
 from datetime import datetime
 import psutil
 import os
+import logging # Import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__) # Initialize logger
 
 @router.get("/health")
 async def health_check():
@@ -41,6 +43,7 @@ async def detailed_health_check():
             }
         }
     except Exception as e:
+        logger.error(f"Detailed health check failed: {e}", exc_info=True) # Add logging
         return {
             "status": "degraded",
             "timestamp": datetime.utcnow().isoformat(),
