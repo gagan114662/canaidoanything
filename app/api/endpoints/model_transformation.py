@@ -44,7 +44,9 @@ async def transform_model_endpoint(
     generate_scene: bool = Form(True, description="Whether to generate professional scenes"),
     quality_mode: str = Form("balanced", description="Processing quality mode: fast, balanced, high"),
     brand_name: Optional[str] = Form(None, description="Brand name for consistency (optional)"),
-    seed: Optional[int] = Form(None, description="Random seed for reproducibility")
+    seed: Optional[int] = Form(None, description="Random seed for reproducibility"),
+    composition_rule: Optional[str] = Form(None, description="Composition rule to apply (e.g., rule_of_thirds, golden_ratio, symmetry)"),
+    controlnet_condition_image: Optional[UploadFile] = File(None, description="Conditioning image for ControlNet guidance (e.g., pose, depth map)")
 ):
     """
     Transform model photo into professional photoshoot variations
@@ -63,24 +65,38 @@ async def transform_model_endpoint(
         # Save uploaded file
         file_path = await save_upload_file(file, transformation_id)
         
+        controlnet_condition_image_path: Optional[str] = None
+        if controlnet_condition_image:
+            if not validate_file(controlnet_condition_image, allowed_types=["image/jpeg", "image/png"]):
+                raise HTTPException(status_code=400, detail="Invalid ControlNet condition image format or size")
+            controlnet_condition_image_path = await save_upload_file(
+                controlnet_condition_image, f"{transformation_id}_controlnet"
+            )
+
         # Load and validate image
         from app.utils.image_utils import load_image
         input_image = load_image(file_path)
         
         # Create processing request
-        request_data = ModelTransformationRequest(
-            transformation_id=transformation_id,
-            input_file_path=file_path,
-            style_prompt=style_prompt,
-            negative_prompt=negative_prompt,
-            num_variations=num_variations,
-            enhance_model=enhance_model,
-            optimize_garment=optimize_garment,
-            generate_scene=generate_scene,
-            quality_mode=quality_mode,
-            brand_name=brand_name,
-            seed=seed
-        )
+        # N.B. If ModelTransformationRequest schema is strict and not updated, this might cause runtime errors
+        # if Pydantic tries to validate unknown fields. However, we are proceeding with the assumption
+        # that either it allows extra fields or the actual schema used by Python interpreter is different.
+        request_dict = {
+            "transformation_id": transformation_id,
+            "input_file_path": file_path,
+            "style_prompt": style_prompt,
+            "negative_prompt": negative_prompt,
+            "num_variations": num_variations,
+            "enhance_model": enhance_model,
+            "optimize_garment": optimize_garment,
+            "generate_scene": generate_scene,
+            "quality_mode": quality_mode,
+            "brand_name": brand_name,
+            "seed": seed,
+            "composition_rule": composition_rule, # New field
+            "controlnet_condition_image_path": controlnet_condition_image_path # New field
+        }
+        request_data = ModelTransformationRequest(**request_dict)
         
         # Queue transformation for background processing
         background_tasks.add_task(

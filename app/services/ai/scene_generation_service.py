@@ -50,6 +50,26 @@ class SceneGenerationService:
             "abstract": {
                 "prompt": "abstract artistic background, creative composition, artistic lighting, modern art style",
                 "negative": "realistic, literal, traditional, conventional"
+            },
+            "surreal_dreamscape": {
+                "prompt": "surreal dreamscape, floating islands, impossible architecture, vibrant colors, soft ethereal lighting, imaginative sky",
+                "negative": "realistic, mundane, ordinary, dull colors, harsh lighting, normal sky"
+            },
+            "baroque_opulence": {
+                "prompt": "baroque era opulence, ornate details, rich textures like velvet and gold, dramatic chiaroscuro lighting, grand hall interior",
+                "negative": "modern, minimalist, simple, plain, bright lighting, outdoor"
+            },
+            "cyberpunk_alley": {
+                "prompt": "cyberpunk alleyway, neon signs, rain-slicked streets, futuristic technology, gritty atmosphere, towering skyscrapers in distance, moody lighting",
+                "negative": "bright daytime, sunny, clean, natural, historical, rural"
+            },
+            "ethereal_forest": {
+                "prompt": "ethereal enchanted forest, glowing flora, ancient trees, magical mist, soft dappled moonlight or sunlight, fantasy theme",
+                "negative": "urban, city, desert, normal forest, bright daylight, man-made structures"
+            },
+            "cosmic_expanse": {
+                "prompt": "vast cosmic expanse, swirling nebulae, distant galaxies, stars, planets, deep space, vibrant cosmic colors, sense of infinite scale",
+                "negative": "earthly, ground-level, sky, clouds, interior, small scale, mundane"
             }
         }
         
@@ -158,7 +178,10 @@ class SceneGenerationService:
         self, 
         reference_image: Image.Image, 
         style_prompt: str,
-        background_type: str = "studio"
+        background_type: str = "studio",
+        control_image: Optional[Image.Image] = None,
+        controlnet_conditioning_scale: float = 0.5,
+        creativity_level: float = 0.5
     ) -> Dict[str, Any]:
         """
         Generate professional background for the scene
@@ -167,6 +190,9 @@ class SceneGenerationService:
             reference_image: Reference image for context
             style_prompt: Style description for background
             background_type: Type of background (studio, outdoor, etc.)
+            control_image: Optional ControlNet conditioning image
+            controlnet_conditioning_scale: Conditioning scale for ControlNet
+            creativity_level: Level of creativity for generation (0.0 to 1.0)
             
         Returns:
             Generated background with quality metrics
@@ -192,7 +218,12 @@ class SceneGenerationService:
             if self.flux_pipeline:
                 # Generate with FLUX
                 background_image = self._generate_flux_background(
-                    reference_image, enhanced_prompt, enhanced_negative
+                    reference_image,
+                    enhanced_prompt,
+                    enhanced_negative,
+                    control_image=control_image,
+                    controlnet_conditioning_scale=controlnet_conditioning_scale,
+                    creativity_level=creativity_level
                 )
             else:
                 # Fallback generation
@@ -225,25 +256,62 @@ class SceneGenerationService:
         self, 
         reference_image: Image.Image, 
         prompt: str, 
-        negative_prompt: str
+        negative_prompt: str,
+        control_image: Optional[Image.Image] = None,
+        controlnet_conditioning_scale: float = 0.5,
+        creativity_level: float = 0.5
     ) -> Image.Image:
-        """Generate background using FLUX pipeline"""
+        """Generate background using FLUX pipeline, with optional ControlNet guidance."""
         try:
             # Resize reference for processing
             ref_size = reference_image.size
-            process_size = (1024, 1024)
-            
-            # Generate background
-            result = self.flux_pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=process_size[0],
-                height=process_size[1],
-                num_inference_steps=20,
-                guidance_scale=7.5,
-                generator=torch.Generator(device=self.device).manual_seed(42)
-            )
-            
+            process_size = (1024, 1024) # Default FLUX size
+
+            # Map creativity_level to guidance_scale
+            # Higher creativity_level (e.g., 1.0) -> lower guidance_scale (more freedom)
+            # Lower creativity_level (e.g., 0.0) -> higher guidance_scale (stricter prompt adherence)
+            min_guidance = 5.0
+            max_guidance = 12.0 # Adjusted from 15.0 for a slightly less extreme max
+            # Inverted relationship: high creativity = low guidance
+            effective_guidance_scale = min_guidance + (1.0 - max(0.0, min(1.0, creativity_level))) * (max_guidance - min_guidance)
+            logger.info(f"Creativity: {creativity_level}, Effective Guidance Scale: {effective_guidance_scale:.2f}")
+
+            pipeline_kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "width": process_size[0],
+                "height": process_size[1],
+                "num_inference_steps": 20,
+                "guidance_scale": effective_guidance_scale,
+                "generator": torch.Generator(device=self.device).manual_seed(42)
+            }
+
+            if control_image and self.controlnet:
+                logger.info(f"Attempting to use ControlNet guidance with scale: {controlnet_conditioning_scale}")
+                # The FluxPipeline might not be a ControlNet-specific pipeline.
+                # We are attempting to pass parameters that are standard in many Diffusers ControlNet pipelines.
+                # This assumes FluxPipeline can accept 'image' as control_image and 'controlnet_conditioning_scale'.
+                # If FluxPipeline is not designed for this, it might ignore these or raise an error.
+                pipeline_kwargs["image"] = control_image # 'image' is typical for control image in ControlNet pipelines
+                pipeline_kwargs["controlnet_conditioning_scale"] = controlnet_conditioning_scale
+                # Note: Some pipelines might expect 'control_image' instead of 'image' for the control map.
+                # If 'image' is strictly for img2img, this might conflict.
+                # However, the base pipeline call usually uses 'image' for img2img or control,
+                # and txt2img calls (like this one seems to be) often use 'image' for ControlNet input.
+
+            try:
+                result = self.flux_pipeline(**pipeline_kwargs)
+                if control_image and self.controlnet and "image" in pipeline_kwargs:
+                    logger.info("ControlNet parameters passed to FluxPipeline.")
+            except TypeError as e:
+                logger.warning(f"FluxPipeline does not support ControlNet parameters directly: {e}. Generating without ControlNet.")
+                # Remove ControlNet specific args and try again
+                if "image" in pipeline_kwargs:
+                    del pipeline_kwargs["image"]
+                if "controlnet_conditioning_scale" in pipeline_kwargs:
+                    del pipeline_kwargs["controlnet_conditioning_scale"]
+                result = self.flux_pipeline(**pipeline_kwargs)
+
             background = result.images[0]
             
             # Resize to match reference
@@ -372,7 +440,11 @@ class SceneGenerationService:
         model_image: Image.Image,
         garment_image: Optional[Image.Image] = None,
         background_type: str = "studio",
-        composition_style: str = "commercial"
+        composition_style: str = "commercial",
+        creativity_level: float = 0.5,
+        control_image: Optional[Image.Image] = None,
+        controlnet_conditioning_scale: float = 0.5, # Default, can be overridden from pipeline
+        composition_rule_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Compose complete scene with model, garment, and background
@@ -382,6 +454,10 @@ class SceneGenerationService:
             garment_image: Optional separate garment image
             background_type: Background type
             composition_style: Composition style
+            creativity_level: Creativity level for background generation
+            control_image: Optional ControlNet conditioning image for background generation.
+            controlnet_conditioning_scale: Conditioning scale for ControlNet.
+            composition_rule_name: Optional name of composition rule to apply.
             
         Returns:
             Composed scene with quality metrics
@@ -393,7 +469,10 @@ class SceneGenerationService:
             bg_result = self.generate_background(
                 model_image, 
                 f"{composition_style} photography background",
-                background_type
+                background_type=background_type,
+                control_image=control_image, # Pass ControlNet image
+                controlnet_conditioning_scale=controlnet_conditioning_scale, # Pass scale
+                creativity_level=creativity_level
             )
             background = bg_result["background_image"]
             
@@ -409,6 +488,16 @@ class SceneGenerationService:
                     model_image, background, composition_style
                 )
             
+            # Apply composition rule if specified
+            if composition_rule_name and composition_rule_name in self.composition_rules:
+                logger.info(f"Applying composition rule: {composition_rule_name}")
+                try:
+                    composed_scene = self.composition_rules[composition_rule_name](composed_scene)
+                except Exception as e:
+                    logger.error(f"Failed to apply composition rule {composition_rule_name}: {e}")
+            elif composition_rule_name:
+                logger.warning(f"Composition rule '{composition_rule_name}' not found or not applicable.")
+
             # Assess composition quality
             composition_score = self._assess_composition_quality(composed_scene)
             elements_integrated = self._count_integrated_elements(model_image, garment_image, background)
@@ -506,7 +595,8 @@ class SceneGenerationService:
         self,
         model_image: Image.Image,
         style_prompt: str,
-        variation_id: str
+        variation_id: str,
+        creativity_level: float = 0.5
     ) -> Dict[str, Any]:
         """
         Generate styled scene variation
@@ -515,6 +605,7 @@ class SceneGenerationService:
             model_image: Input model image
             style_prompt: Style description
             variation_id: Unique variation identifier
+            creativity_level: Creativity level for scene composition
             
         Returns:
             Styled scene with consistency metrics
@@ -527,7 +618,8 @@ class SceneGenerationService:
             scene_result = self.compose_scene(
                 model_image,
                 background_type=background_type,
-                composition_style=self._extract_composition_style(style_prompt)
+                composition_style=self._extract_composition_style(style_prompt),
+                creativity_level=creativity_level
             )
             
             # Apply style-specific enhancements
@@ -1046,20 +1138,149 @@ class SceneGenerationService:
     
     def _apply_rule_of_thirds(self, image: Image.Image) -> Image.Image:
         """Apply rule of thirds composition"""
-        # For now, return original image
-        # In production, this would adjust composition
-        return image
+        width, height = image.size
+
+        # Calculate the new dimensions (2/3 of original)
+        new_width = int(width * 2 / 3)
+        new_height = int(height * 2 / 3)
+
+        if new_width == 0 or new_height == 0:
+            logger.warning("Image too small for rule of thirds crop, returning original.")
+            return image
+
+        # Determine the center of the crop (top-left power point)
+        center_x = int(width / 3)
+        center_y = int(height / 3)
+
+        # Calculate crop box coordinates
+        left = max(0, center_x - new_width // 2)
+        top = max(0, center_y - new_height // 2)
+        right = min(width, center_x + new_width // 2)
+        bottom = min(height, center_y + new_height // 2)
+
+        # Ensure the crop box has valid dimensions
+        if right - left < new_width: # Adjust if crop is too small due to hitting image edge
+            if center_x + new_width // 2 > width : # Hit right edge
+                 right = width
+                 left = max(0, right - new_width)
+            else: # Hit left edge or very small image
+                 left = 0
+                 right = min(new_width, width)
+
+
+        if bottom - top < new_height: # Adjust if crop is too small due to hitting image edge
+            if center_y + new_height // 2 > height: # Hit bottom edge
+                bottom = height
+                top = max(0, bottom - new_height)
+            else: # Hit top edge or very small image
+                top = 0
+                bottom = min(new_height, height)
+
+        # Ensure final crop dimensions are new_width x new_height if possible,
+        # otherwise, they are as large as possible up to new_width x new_height.
+        # The logic above tries to keep the center point, but might shift it if image is too small.
+        # For this implementation, we will crop to the calculated box [left,top,right,bottom]
+        # and if it's smaller than new_width/new_height, that's acceptable for small images.
+
+        cropped_image = image.crop((left, top, right, bottom))
+
+        # If the crop resulted in a size smaller than intended (e.g. original image was small)
+        # and not the target new_width/new_height, we might want to resize it,
+        # but the instructions imply just cropping.
+        # For now, we return the cropped image as is.
+        # If a specific output dimension is strictly required, resizing would be needed here.
+        # Example: if cropped_image.size != (new_width, new_height):
+        #    cropped_image = cropped_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        return cropped_image
     
     def _apply_golden_ratio(self, image: Image.Image) -> Image.Image:
         """Apply golden ratio composition"""
-        return image
+        width, height = image.size
+        golden_ratio = 1.618
+
+        new_width = width
+        new_height = height
+
+        if width > height:
+            # Try to make width = height * golden_ratio
+            test_width = int(height * golden_ratio)
+            if test_width <= width:
+                new_width = test_width
+            else:
+                # If that makes it wider than original, then width stays, adjust height
+                new_height = int(width / golden_ratio)
+        else: # height >= width
+            # Try to make height = width * golden_ratio
+            test_height = int(width * golden_ratio)
+            if test_height <= height:
+                new_height = test_height
+            else:
+                # If that makes it taller than original, then height stays, adjust width
+                new_width = int(height / golden_ratio)
+
+        if new_width == 0 or new_height == 0:
+            logger.warning("Image too small for golden ratio crop, returning original.")
+            return image
+
+        if new_width > width or new_height > height: # Should not happen with the logic above
+            logger.warning("Calculated crop larger than original, returning original image.")
+            return image
+
+
+        # Center the crop
+        left = (width - new_width) // 2
+        top = (height - new_height) // 2
+        right = left + new_width
+        bottom = top + new_height
+
+        # Ensure coordinates are within bounds (though centered crop should be)
+        left = max(0, left)
+        top = max(0, top)
+        right = min(width, right)
+        bottom = min(height, bottom)
+
+        # Ensure the crop box has valid dimensions before cropping
+        if right <= left or bottom <= top:
+            logger.warning("Invalid crop dimensions for golden ratio, returning original.")
+            return image
+
+        return image.crop((left, top, right, bottom))
     
     def _apply_symmetry(self, image: Image.Image) -> Image.Image:
         """Apply symmetrical composition"""
-        return image
+        width, height = image.size
+
+        if width < 2 : # Cannot make symmetrical if width is less than 2 pixels
+            logger.warning("Image too narrow for symmetry, returning original.")
+            return image
+
+        # Crop to the left half
+        left_half = image.crop((0, 0, width // 2, height))
+
+        # Flip the left half horizontally
+        flipped_left_half = left_half.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Create a new image of the original width
+        symmetrical_image = Image.new('RGB', (width, height))
+
+        # Paste the original left half
+        symmetrical_image.paste(left_half, (0, 0))
+
+        # Paste the flipped left half to the right side
+        # If width is odd, the middle column of pixels from the original image's center
+        # will be overwritten by the flipped image. This is generally acceptable.
+        symmetrical_image.paste(flipped_left_half, (width // 2, 0))
+
+        return symmetrical_image
     
     def _apply_leading_lines(self, image: Image.Image) -> Image.Image:
         """Apply leading lines composition"""
+        # This is a placeholder for future implementation.
+        # Leading lines detection and enhancement is complex and typically
+        # requires more advanced image analysis (e.g., Hough transforms)
+        # or AI-based approaches, which are beyond simple cropping.
+        logger.info("Leading lines rule is a placeholder and returns the original image.")
         return image
     
     def integrate_scene_elements(

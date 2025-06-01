@@ -75,6 +75,30 @@ class ModelTransformationPipeline:
                 "lighting_type": "brand_standard",
                 "enhancement_level": 0.8,
                 "creativity_level": 0.6
+            },
+            "surreal_fashion": {
+                "style_prompt": "surreal fashion photography, dreamlike atmosphere, unexpected elements, artistic interpretation of clothing, highly imaginative",
+                "negative_prompt": "ordinary, realistic, mundane, simple, boring, commercial photography",
+                "background_type": "surreal_dreamscape",
+                "lighting_type": "ethereal",
+                "enhancement_level": 0.85,
+                "creativity_level": 0.95
+            },
+            "painterly_portrait": {
+                "style_prompt": "digital painting fashion portrait, visible brushstrokes, impasto texture, expressive, fine art style, focused on model and garment",
+                "negative_prompt": "photorealistic, clean lines, commercial, flat colors, simple background",
+                "background_type": "abstract",
+                "lighting_type": "dramatic",
+                "enhancement_level": 0.7,
+                "creativity_level": 0.8
+            },
+            "avant_garde_design": {
+                "style_prompt": "avant-garde fashion statement, bold unconventional design, abstract composition, experimental lighting, conceptual art",
+                "negative_prompt": "traditional, classic, simple, commercial, boring, realistic",
+                "background_type": "abstract", # Or "cyberpunk_alley"
+                "lighting_type": "creative",
+                "enhancement_level": 0.75,
+                "creativity_level": 0.9
             }
         }
         
@@ -133,7 +157,9 @@ class ModelTransformationPipeline:
         optimize_garment: bool = True,
         generate_scene: bool = True,
         quality_mode: str = "balanced",  # "fast", "balanced", "high"
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        composition_rule: Optional[str] = None,
+        controlnet_condition_image_path: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Transform model photo into professional photoshoot variations
@@ -148,15 +174,18 @@ class ModelTransformationPipeline:
             generate_scene: Whether to generate professional scenes
             quality_mode: Processing quality mode
             seed: Random seed for reproducibility
+            composition_rule: Optional composition rule to apply.
+            controlnet_condition_image_path: Optional path to ControlNet condition image.
             
         Returns:
             Transformation results with variations and metadata
         """
         try:
             start_time = time.time()
-            transformation_id = str(uuid.uuid4())
+            transformation_id = str(uuid.uuid4()) # This ID is internal to this method call.
+                                                 # The one from request_data is the overall job ID.
             
-            logger.info(f"Starting model transformation {transformation_id}")
+            logger.info(f"Starting model transformation (internal id: {transformation_id})")
             
             # Ensure models are loaded
             if not self.services_loaded:
@@ -166,6 +195,20 @@ class ModelTransformationPipeline:
             if seed is not None:
                 torch.manual_seed(seed)
                 np.random.seed(seed)
+
+            control_image_pil: Optional[Image.Image] = None
+            if controlnet_condition_image_path:
+                try:
+                    # Ensure image_utils.load_image is available. It's usually imported at the top.
+                    from app.utils.image_utils import load_image
+                    control_image_pil = load_image(controlnet_condition_image_path)
+                    logger.info(f"Successfully loaded ControlNet condition image from: {controlnet_condition_image_path}")
+                except ImportError:
+                    logger.error("Failed to import app.utils.image_utils.load_image. Cannot load ControlNet image.")
+                except FileNotFoundError:
+                    logger.error(f"ControlNet condition image not found at path: {controlnet_condition_image_path}")
+                except Exception as e:
+                    logger.error(f"Failed to load ControlNet condition image from {controlnet_condition_image_path}: {e}")
             
             # Validate and preprocess input
             processed_image = self._preprocess_input(model_image, quality_mode)
@@ -215,12 +258,14 @@ class ModelTransformationPipeline:
                 if quality_mode == "fast":
                     # Sequential processing for fast mode
                     variations = self._generate_variations_sequential(
-                        processed_image, style_prompt, negative_prompt, style_types, generate_scene
+                        processed_image, style_prompt, negative_prompt, style_types, generate_scene,
+                        composition_rule, control_image_pil # Pass new params
                     )
                 else:
                     # Parallel processing for balanced/high quality
                     variations = self._generate_variations_parallel(
-                        processed_image, style_prompt, negative_prompt, style_types, generate_scene
+                        processed_image, style_prompt, negative_prompt, style_types, generate_scene,
+                        composition_rule, control_image_pil # Pass new params
                     )
                 
                 variation_times = [v.get("processing_time", 0) for v in variations]
@@ -321,17 +366,28 @@ class ModelTransformationPipeline:
         self,
         image: Image.Image,
         style_prompt: str,
-        background_type: str
+        background_type: str,
+        creativity_level: float = 0.5,
+        composition_rule: Optional[str] = None,
+        control_image: Optional[Image.Image] = None
     ) -> Dict[str, Any]:
         """Execute scene generation step"""
         try:
             start_time = time.time()
             
             # Generate scene
+            # ControlNet conditioning scale can be a fixed value or further exposed if needed.
+            # Using a default/fixed value like 0.75 for now when ControlNet image is provided.
+            controlnet_cond_scale = 0.75 if control_image else 0.5 # Example: higher if control image used
+
             scene_result = self.scene_generation_service.compose_scene(
                 model_image=image,
                 background_type=background_type,
-                composition_style=self._extract_composition_style(style_prompt)
+                composition_style=self._extract_composition_style(style_prompt),
+                creativity_level=creativity_level,
+                control_image=control_image, # Pass control_image
+                controlnet_conditioning_scale=controlnet_cond_scale, # Pass scale
+                composition_rule_name=composition_rule # Pass composition_rule
             )
             
             # Apply lighting
@@ -366,21 +422,27 @@ class ModelTransformationPipeline:
         self,
         image: Image.Image,
         style_config: Dict[str, Any],
-        variation_name: str
+        variation_name: str,
+        composition_rule: Optional[str] = None,
+        control_image: Optional[Image.Image] = None
     ) -> Dict[str, Any]:
         """Generate a single style variation"""
         try:
             start_time = time.time()
+            creativity_level = style_config.get("creativity_level", 0.5) # Extract creativity_level
             
-            # Apply style-specific enhancements
-            enhanced_image = self._apply_style_enhancements(image, style_config)
+            # Apply style-specific enhancements, now with creativity_level
+            enhanced_image = self._apply_style_enhancements(image, style_config, creativity_level)
             
             # Generate scene if needed
             if style_config.get("background_type"):
                 scene_result = self.generate_scene_step(
                     enhanced_image,
                     style_config["style_prompt"],
-                    style_config["background_type"]
+                    style_config["background_type"],
+                    creativity_level=creativity_level, # Pass creativity_level
+                    composition_rule=composition_rule,  # Pass new param
+                    control_image=control_image        # Pass new param
                 )
                 final_image = scene_result["scene_image"]
                 scene_quality = scene_result["scene_quality_score"]
@@ -449,7 +511,9 @@ class ModelTransformationPipeline:
         style_prompt: str,
         negative_prompt: str,
         style_types: List[str],
-        generate_scene: bool
+        generate_scene: bool,
+        composition_rule: Optional[str] = None,
+        control_image: Optional[Image.Image] = None
     ) -> List[Dict[str, Any]]:
         """Generate variations sequentially (faster, lower resource usage)"""
         variations = []
@@ -464,7 +528,10 @@ class ModelTransformationPipeline:
                 style_config["negative_prompt"] = f"{style_config['negative_prompt']}, {negative_prompt}"
                 
                 # Generate variation
-                variation = self.generate_style_variation(image, style_config, style_type)
+                variation = self.generate_style_variation(
+                    image, style_config, style_type,
+                    composition_rule, control_image # Pass new params
+                )
                 variations.append(variation)
                 
             except Exception as e:
@@ -480,7 +547,9 @@ class ModelTransformationPipeline:
         style_prompt: str,
         negative_prompt: str,
         style_types: List[str],
-        generate_scene: bool
+        generate_scene: bool,
+        composition_rule: Optional[str] = None,
+        control_image: Optional[Image.Image] = None
     ) -> List[Dict[str, Any]]:
         """Generate variations in parallel (higher quality, more resources)"""
         variations = []
@@ -491,7 +560,10 @@ class ModelTransformationPipeline:
                 style_config["style_prompt"] = f"{style_config['style_prompt']}, {style_prompt}"
                 style_config["negative_prompt"] = f"{style_config['negative_prompt']}, {negative_prompt}"
                 
-                return self.generate_style_variation(image, style_config, style_type)
+                return self.generate_style_variation(
+                    image, style_config, style_type,
+                    composition_rule, control_image # Pass new params
+                )
             except Exception as e:
                 logger.error(f"Parallel variation generation failed for {style_type}: {e}")
                 return self._create_fallback_variation(image, style_type)
@@ -521,41 +593,47 @@ class ModelTransformationPipeline:
     def _apply_style_enhancements(
         self,
         image: Image.Image,
-        style_config: Dict[str, Any]
+        style_config: Dict[str, Any],
+        creativity_level: float = 0.5
     ) -> Image.Image:
-        """Apply style-specific enhancements to image"""
+        """Apply style-specific enhancements to image, modulated by creativity."""
         try:
             enhanced = image.copy()
-            enhancement_level = style_config.get("enhancement_level", 0.7)
+            base_enhancement_level = style_config.get("enhancement_level", 0.7)
             
+            # Modulate enhancement_level by creativity_level
+            # creativity_level 0.5 = no change, 1.0 = +20% effect, 0.0 = -20% effect
+            modulation_factor = 1.0 + (creativity_level - 0.5) * 0.4
+            current_enhancement_level = base_enhancement_level * modulation_factor
+            logger.info(f"Style: {style_config.get('style_prompt','unknown')}, Base Enhance: {base_enhancement_level:.2f}, Creativity: {creativity_level:.2f}, Modulated Enhance: {current_enhancement_level:.2f}")
+
             # Apply enhancements based on style
-            if "editorial" in style_config.get("style_prompt", "").lower():
-                # Editorial: Higher contrast, dramatic
+            style_prompt_lower = style_config.get("style_prompt", "").lower()
+
+            if "editorial" in style_prompt_lower:
                 enhanced = enhance_image(
                     enhanced,
-                    contrast=1.0 + enhancement_level * 0.3,
-                    sharpness=1.0 + enhancement_level * 0.2
+                    contrast=1.0 + current_enhancement_level * 0.3, # Base change factor 0.3 for contrast
+                    sharpness=1.0 + current_enhancement_level * 0.2 # Base change factor 0.2 for sharpness
                 )
-            elif "commercial" in style_config.get("style_prompt", "").lower():
-                # Commercial: Clean, bright
+            elif "commercial" in style_prompt_lower:
                 enhanced = enhance_image(
                     enhanced,
-                    brightness=1.0 + enhancement_level * 0.1,
-                    saturation=1.0 + enhancement_level * 0.1
+                    brightness=1.0 + current_enhancement_level * 0.1, # Base change factor 0.1
+                    saturation=1.0 + current_enhancement_level * 0.1  # Base change factor 0.1
                 )
-            elif "lifestyle" in style_config.get("style_prompt", "").lower():
-                # Lifestyle: Soft, natural
+            elif "lifestyle" in style_prompt_lower:
                 enhanced = enhance_image(
                     enhanced,
-                    saturation=1.0 - enhancement_level * 0.05,
-                    brightness=1.0 + enhancement_level * 0.05
+                    saturation=1.0 - current_enhancement_level * 0.05, # Base change factor -0.05 (desaturate slightly)
+                    brightness=1.0 + current_enhancement_level * 0.05  # Base change factor 0.05
                 )
-            elif "artistic" in style_config.get("style_prompt", "").lower():
-                # Artistic: Creative, enhanced colors
+            elif "artistic" in style_prompt_lower or "surreal" in style_prompt_lower or "avant_garde" in style_prompt_lower or "painterly" in style_prompt_lower :
+                # Broader category for more creative styles
                 enhanced = enhance_image(
                     enhanced,
-                    saturation=1.0 + enhancement_level * 0.2,
-                    contrast=1.0 + enhancement_level * 0.15
+                    saturation=1.0 + current_enhancement_level * 0.2, # Base change factor 0.2
+                    contrast=1.0 + current_enhancement_level * 0.15   # Base change factor 0.15
                 )
             
             return enhanced
