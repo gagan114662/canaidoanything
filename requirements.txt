@@ -60,3 +60,9 @@ isort>=5.12.0
 
 # Optional: For better performance
 # onnxruntime-gpu  # if using ONNX models
+
+# Specific AI/ML libraries identified from service imports
+mediapipe
+insightface
+scikit-learn
+peft

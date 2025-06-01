@@ -9,7 +9,8 @@ celery_app = Celery(
     backend=settings.CELERY_RESULT_BACKEND,
     include=[
         "app.services.tasks.image_processing",
-        "app.services.tasks.ai_models"
+        "app.services.tasks.ai_models",
+        "app.services.tasks.model_transformation"
     ]
 )
 
