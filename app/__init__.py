@@ -1,0 +1,1 @@
+# Garment Creative AI Application Package

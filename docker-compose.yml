@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=false
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./app/static:/app/app/static
+      - model_cache:/root/.cache
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  celery-worker:
+    build: .
+    command: celery -A app.services.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DEBUG=false
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./app/static:/app/app/static
+      - model_cache:/root/.cache
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  celery-beat:
+    build: .
+    command: celery -A app.services.celery_app beat --loglevel=info
+    environment:
+      - DEBUG=false
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  flower:
+    build: .
+    command: celery -A app.services.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - DEBUG=false
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  model_cache:
