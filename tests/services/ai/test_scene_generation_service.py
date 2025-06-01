@@ -174,6 +174,7 @@ if __name__ == '__main__':
 
 # New Test Class for Backgrounds
 from unittest.mock import patch, MagicMock
+import numpy as np # For saliency map test
 
 class TestSceneGenerationServiceBackgrounds(unittest.TestCase):
 
@@ -246,3 +247,81 @@ class TestSceneGenerationServiceBackgrounds(unittest.TestCase):
         self.assertIn("professional photography studio", called_prompt)
         self.assertIn("clean white background", called_prompt)
         mock_fallback_gen.assert_not_called()
+
+class TestSceneGenerationServiceCropSuggestion(unittest.TestCase):
+
+    def setUp(self):
+        if SceneGenerationService is None:
+            self.skipTest("SceneGenerationService could not be imported.")
+        self.service = SceneGenerationService()
+        # No model loading mock needed if suggest_crop is independent of models
+        self.dummy_image = Image.new('RGB', (300, 200), 'red')
+
+    @patch('app.utils.image_utils.get_saliency_map')
+    def test_suggest_crop_calls_saliency(self, mock_get_saliency):
+        # Mock saliency map: a simple map with the center being most salient
+        mock_saliency_data = np.zeros((200, 300), dtype=np.uint8)
+        cv2.circle(mock_saliency_data, (150, 100), 50, 255, -1) # Circle in center
+        mock_get_saliency.return_value = mock_saliency_data
+
+        result = self.service.suggest_crop(self.dummy_image)
+
+        mock_get_saliency.assert_called_once_with(self.dummy_image)
+        self.assertIn("x", result)
+        self.assertIn("y", result)
+        self.assertIn("width", result)
+        self.assertIn("height", result)
+        self.assertIn("rule_applied", result)
+        self.assertEqual(result["rule_applied"], "saliency_basic")
+        # Based on mock saliency (center circle of radius 50 on 300x200 image)
+        # Threshold at 75 percentile of this map would make the circle salient.
+        # Min/max row: 100-50=50, 100+50=150. Min/max col: 150-50=100, 150+50=200
+        # x=100, y=50, width=101, height=101 (approx)
+        self.assertGreater(result["width"], 0)
+        self.assertGreater(result["height"], 0)
+        self.assertLessEqual(result["x"] + result["width"], 300)
+        self.assertLessEqual(result["y"] + result["height"], 200)
+
+
+    @patch('app.utils.image_utils.get_saliency_map')
+    def test_suggest_crop_with_rule(self, mock_get_saliency):
+        mock_saliency_data = np.zeros((200, 300), dtype=np.uint8)
+        cv2.circle(mock_saliency_data, (150, 100), 30, 255, -1)
+        mock_get_saliency.return_value = mock_saliency_data
+
+        rule_name = "rule_of_thirds" # Assuming this rule exists in self.service.composition_rules
+        result = self.service.suggest_crop(self.dummy_image, composition_rule_name=rule_name)
+
+        mock_get_saliency.assert_called_once_with(self.dummy_image)
+        self.assertIn("x", result)
+        self.assertEqual(result["rule_applied"], f"saliency_with_contemplated_{rule_name}")
+
+    @patch('app.utils.image_utils.get_saliency_map')
+    def test_suggest_crop_no_salient_points(self, mock_get_saliency):
+        # Mock saliency map: all zeros, so no points above threshold
+        mock_get_saliency.return_value = np.zeros((200, 300), dtype=np.uint8)
+
+        result = self.service.suggest_crop(self.dummy_image)
+
+        mock_get_saliency.assert_called_once_with(self.dummy_image)
+        self.assertEqual(result["x"], 0)
+        self.assertEqual(result["y"], 0)
+        self.assertEqual(result["width"], 300)
+        self.assertEqual(result["height"], 200)
+        self.assertIsNone(result["rule_applied"]) # Or "saliency_basic" if it defaults before empty check
+                                                # Based on current impl, it's None for this case.
+
+    @patch('app.utils.image_utils.get_saliency_map')
+    def test_suggest_crop_empty_saliency_map(self, mock_get_saliency):
+        # Mock saliency map: empty array
+        mock_get_saliency.return_value = np.array([])
+
+        result = self.service.suggest_crop(self.dummy_image)
+
+        mock_get_saliency.assert_called_once_with(self.dummy_image)
+        self.assertEqual(result["x"], 0)
+        self.assertEqual(result["y"], 0)
+        self.assertEqual(result["width"], 300)
+        self.assertEqual(result["height"], 200)
+        self.assertIsNone(result["rule_applied"])
+        self.assertIn("Empty saliency map", result.get("error", ""))

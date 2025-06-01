@@ -8,6 +8,7 @@ import time
 import math
 
 from app.core.config import settings
+from app.utils.image_utils import get_saliency_map # New import
 
 # FLUX and related imports
 try:
@@ -1567,3 +1568,68 @@ class SceneGenerationService:
             
         except Exception as e:
             logger.error(f"Failed to unload models: {e}")
+
+    def suggest_crop(self, image: Image.Image, composition_rule_name: Optional[str] = None) -> Dict[str, Any]:
+        logger.info(f"Suggesting crop for image. Rule: {composition_rule_name}")
+        original_width, original_height = image.size
+
+        try:
+            saliency_map = get_saliency_map(image) # HxW numpy array
+
+            # Find bounding box of the most salient region (e.g., top 25% brightest pixels)
+            # This is a simplified approach for a mock.
+            if saliency_map.size == 0: # Handle empty saliency map
+                logger.warning("Saliency map is empty, suggesting full image.")
+                return {"x": 0, "y": 0, "width": original_width, "height": original_height, "rule_applied": None, "error": "Empty saliency map"}
+
+            threshold_value = np.percentile(saliency_map, 75)
+            salient_points = np.argwhere(saliency_map >= threshold_value) # array of [row, col]
+
+            if salient_points.size == 0: # No salient points found above threshold
+                logger.warning("No salient points found above threshold, suggesting full image.")
+                return {"x": 0, "y": 0, "width": original_width, "height": original_height, "rule_applied": None}
+
+            min_row, min_col = salient_points.min(axis=0)
+            max_row, max_col = salient_points.max(axis=0)
+
+            # Suggested crop based purely on saliency
+            s_x = int(min_col)
+            s_y = int(min_row)
+            s_width = int(max_col - min_col + 1)
+            s_height = int(max_row - min_row + 1)
+
+            # Ensure width and height are positive
+            s_width = max(1, s_width)
+            s_height = max(1, s_height)
+
+            crop_coords = {"x": s_x, "y": s_y, "width": s_width, "height": s_height}
+            rule_applied_log = "saliency_basic"
+
+            if composition_rule_name and composition_rule_name in self.composition_rules:
+                logger.info(f"Saliency crop suggested. Rule '{composition_rule_name}' provided for consideration (adjustment logic is conceptual).")
+                # Conceptual: future logic could adjust crop_coords based on the rule.
+                # For example, try to center the salient box according to the rule, or ensure aspect ratio.
+                # For now, we just log and use the saliency-derived box.
+                rule_applied_log = f"saliency_with_contemplated_{composition_rule_name}"
+
+            # Clamp coordinates to image bounds
+            crop_coords["x"] = max(0, crop_coords["x"])
+            crop_coords["y"] = max(0, crop_coords["y"])
+            crop_coords["width"] = min(original_width - crop_coords["x"], crop_coords["width"])
+            crop_coords["height"] = min(original_height - crop_coords["y"], crop_coords["height"])
+
+            # Ensure width/height are not zero after clamping if x/y were pushed to image edge
+            if crop_coords["x"] + crop_coords["width"] > original_width:
+                crop_coords["width"] = original_width - crop_coords["x"]
+            if crop_coords["y"] + crop_coords["height"] > original_height:
+                crop_coords["height"] = original_height - crop_coords["y"]
+
+            if crop_coords["width"] <= 0 or crop_coords["height"] <= 0:
+                logger.warning("Calculated crop has zero or negative dimension, suggesting full image.")
+                return {"x": 0, "y": 0, "width": original_width, "height": original_height, "rule_applied": None, "error": "Invalid crop dimension after clamping"}
+
+            return {"x": crop_coords["x"], "y": crop_coords["y"], "width": crop_coords["width"], "height": crop_coords["height"], "rule_applied": rule_applied_log}
+
+        except Exception as e:
+            logger.error(f"Error during crop suggestion: {str(e)}")
+            return {"x": 0, "y": 0, "width": original_width, "height": original_height, "error": str(e), "rule_applied": None}

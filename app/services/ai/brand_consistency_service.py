@@ -808,6 +808,31 @@ class BrandConsistencyService:
         except Exception as e:
             logger.error(f"Professional finish failed: {e}")
             return image
+
+    def apply_advanced_color_grade(self, image: Image.Image, brand_lut_path: Optional[str]) -> Dict[str, Any]:
+        if not brand_lut_path:
+            logger.info("No brand LUT path provided for advanced color grading.")
+            return {"graded_image": image, "lut_applied": None, "error": None}
+
+        try:
+            # Assume brand_lut_path is a path to a .cube file or similar
+            # For now, this will call our placeholder/mocked apply_lut
+            logger.info(f"Applying brand LUT: {brand_lut_path}")
+            graded_image = apply_lut(image.copy(), brand_lut_path)
+
+            # Check if image changed to confirm mock effect, if applicable
+            # This check is basic; a more robust check might involve image statistics
+            # if the mock effect is subtle or if the original image could be identical to the LUT-applied one by chance.
+            applied_successfully = image.tobytes() != graded_image.tobytes() if graded_image else False
+
+            return {
+                "graded_image": graded_image,
+                "lut_applied": brand_lut_path if applied_successfully else None,
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"Error applying brand LUT {brand_lut_path}: {str(e)}")
+            return {"graded_image": image, "lut_applied": None, "error": str(e)}
     
     # Assessment methods
     def _assess_color_consistency(self, image: Image.Image, guidelines: Dict[str, Any]) -> float:
@@ -1010,3 +1035,4 @@ class BrandConsistencyService:
 
 # Add missing import
 from PIL import ImageFilter
+from app.utils.image_utils import apply_lut # New import for LUT application

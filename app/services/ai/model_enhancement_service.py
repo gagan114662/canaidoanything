@@ -512,5 +512,36 @@ class ModelEnhancementService:
         except Exception as e:
             logger.error(f"Failed to unload models: {e}")
 
+    def apply_ai_sharpening(self, image: Image.Image, intensity: float = 0.5) -> Dict[str, Any]:
+        logger.info("Applying AI smart sharpening to model.")
+        try:
+            sharpened_image = ai_smart_sharpen(image.copy(), intensity=intensity)
+            applied_successfully = image.tobytes() != sharpened_image.tobytes() if sharpened_image else False
+            return {
+                "processed_image": sharpened_image,
+                "operation": "ai_sharpen",
+                "intensity": intensity,
+                "success": applied_successfully
+            }
+        except Exception as e:
+            logger.error(f"Error during AI smart sharpening for model: {str(e)}")
+            return {"processed_image": image, "operation": "ai_sharpen", "success": False, "error": str(e)}
+
+    def apply_ai_denoising(self, image: Image.Image, strength: float = 0.5) -> Dict[str, Any]:
+        logger.info("Applying AI smart denoising to model.")
+        try:
+            denoised_image = ai_smart_denoise(image.copy(), strength=strength)
+            applied_successfully = image.tobytes() != denoised_image.tobytes() if denoised_image else False
+            return {
+                "processed_image": denoised_image,
+                "operation": "ai_denoise",
+                "strength": strength,
+                "success": applied_successfully
+            }
+        except Exception as e:
+            logger.error(f"Error during AI smart denoising for model: {str(e)}")
+            return {"processed_image": image, "operation": "ai_denoise", "success": False, "error": str(e)}
+
 # Add missing import
 import time
+from app.utils.image_utils import ai_smart_sharpen, ai_smart_denoise

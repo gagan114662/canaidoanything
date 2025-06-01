@@ -125,6 +125,52 @@ class TestModelTransformationApiParams(unittest.TestCase):
         self.assertIsNone(getattr(request_data_passed, 'composition_rule', None))
         self.assertIsNone(getattr(request_data_passed, 'controlnet_condition_image_path', None))
 
+    @patch('app.api.endpoints.model_transformation.process_transformation_task', new_callable=MagicMock)
+    @patch('app.api.endpoints.model_transformation.transformation_pipeline', new_callable=MagicMock)
+    def test_transform_model_endpoint_with_all_post_processing_flags(self, mock_pipeline_global, mock_process_task):
+        """Test the endpoint with all new post-processing flags set."""
+        main_image_bytes = io.BytesIO()
+        Image.new('RGB', (60, 30), color='purple').save(main_image_bytes, format='JPEG')
+        main_image_bytes.seek(0)
+
+        brand_lut_path = "brand_luts/my_brand.cube"
+        cinematic_style = "vintage"
+
+        form_data = {
+            "style_prompt": "test_all_flags",
+            "num_variations": 1,
+            "enhance_model": "true", # FastAPI handles string "true" to bool True
+            "optimize_garment": "true",
+            "generate_scene": "true",
+            "quality_mode": "fast",
+            "apply_brand_color_grade_lut": brand_lut_path,
+            "apply_cinematic_color_grade_style": cinematic_style,
+            "use_ai_smart_sharpening": "true",
+            "use_ai_smart_denoising": "true",
+            "use_ai_detail_enhancement": "true",
+            "request_composition_suggestion": "true"
+        }
+
+        response = self.client.post(
+            "/transform-model",
+            data=form_data,
+            files={"file": ("main3.jpg", main_image_bytes, "image/jpeg")}
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        mock_process_task.assert_called_once()
+
+        call_args = mock_process_task.call_args
+        self.assertIsNotNone(call_args)
+        request_data_passed = call_args.args[2] # request_data is the 3rd positional arg
+
+        self.assertEqual(getattr(request_data_passed, 'apply_brand_color_grade_lut', None), brand_lut_path)
+        self.assertEqual(getattr(request_data_passed, 'apply_cinematic_color_grade_style', None), cinematic_style)
+        self.assertTrue(getattr(request_data_passed, 'use_ai_smart_sharpening', False))
+        self.assertTrue(getattr(request_data_passed, 'use_ai_smart_denoising', False))
+        self.assertTrue(getattr(request_data_passed, 'use_ai_detail_enhancement', False))
+        self.assertTrue(getattr(request_data_passed, 'request_composition_suggestion', False))
+
 
 # This allows running the tests directly if the file is executed
 if __name__ == '__main__':

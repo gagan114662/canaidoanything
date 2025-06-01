@@ -46,7 +46,13 @@ async def transform_model_endpoint(
     brand_name: Optional[str] = Form(None, description="Brand name for consistency (optional)"),
     seed: Optional[int] = Form(None, description="Random seed for reproducibility"),
     composition_rule: Optional[str] = Form(None, description="Composition rule to apply (e.g., rule_of_thirds, golden_ratio, symmetry)"),
-    controlnet_condition_image: Optional[UploadFile] = File(None, description="Conditioning image for ControlNet guidance (e.g., pose, depth map)")
+    controlnet_condition_image: Optional[UploadFile] = File(None, description="Conditioning image for ControlNet guidance (e.g., pose, depth map)"),
+    apply_brand_color_grade_lut: Optional[str] = Form(None, description="Name or path of brand LUT for color grading."),
+    apply_cinematic_color_grade_style: Optional[str] = Form(None, description="Cinematic color grade style (e.g., vintage, noir)."),
+    use_ai_smart_sharpening: Optional[bool] = Form(False, description="Enable AI smart sharpening."),
+    use_ai_smart_denoising: Optional[bool] = Form(False, description="Enable AI smart denoising."),
+    use_ai_detail_enhancement: Optional[bool] = Form(False, description="Enable AI detail enhancement for model and fabric."),
+    request_composition_suggestion: Optional[bool] = Form(False, description="Request an AI crop suggestion.")
 ):
     """
     Transform model photo into professional photoshoot variations
@@ -93,8 +99,14 @@ async def transform_model_endpoint(
             "quality_mode": quality_mode,
             "brand_name": brand_name,
             "seed": seed,
-            "composition_rule": composition_rule, # New field
-            "controlnet_condition_image_path": controlnet_condition_image_path # New field
+            "composition_rule": composition_rule,
+            "controlnet_condition_image_path": controlnet_condition_image_path,
+            "apply_brand_color_grade_lut": apply_brand_color_grade_lut,
+            "apply_cinematic_color_grade_style": apply_cinematic_color_grade_style,
+            "use_ai_smart_sharpening": use_ai_smart_sharpening,
+            "use_ai_smart_denoising": use_ai_smart_denoising,
+            "use_ai_detail_enhancement": use_ai_detail_enhancement,
+            "request_composition_suggestion": request_composition_suggestion
         }
         request_data = ModelTransformationRequest(**request_dict)
         

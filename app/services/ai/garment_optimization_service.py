@@ -10,6 +10,8 @@ import time
 
 from app.core.config import settings
 from app.services.ai.sam2_service import SAM2Service
+from app.utils.image_utils import apply_lut # Existing import for LUT application
+from app.utils.image_utils import ai_smart_sharpen, ai_smart_denoise # New imports
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,14 @@ class GarmentOptimizationService:
             "jacket": ["lapels", "buttons", "collar", "structured"],
             "top": ["shoulders", "neckline", "torso"],
             "bottom": ["waist", "legs", "hips"]
+        }
+
+        # Predefined cinematic LUTs (paths are conceptual for now)
+        self.cinematic_luts = {
+            "vintage": "luts/cinematic/vintage_look.cube",
+            "noir": "luts/cinematic/film_noir.cube",
+            "vibrant_pop": "luts/cinematic/vibrant_pop.cube",
+            "teal_orange": "luts/cinematic/teal_orange.cube"
         }
     
     def load_models(self):
@@ -1183,3 +1193,59 @@ class GarmentOptimizationService:
             
         except Exception as e:
             logger.error(f"Failed to unload models: {e}")
+
+    def apply_cinematic_color_grade(self, image: Image.Image, grade_style: str) -> Dict[str, Any]:
+        lut_path = self.cinematic_luts.get(grade_style)
+        if not lut_path:
+            logger.warning(f"Cinematic grade style '{grade_style}' not found.")
+            return {"graded_image": image, "grade_applied": None, "error": f"Grade style '{grade_style}' not found."}
+
+        try:
+            logger.info(f"Applying cinematic LUT: {lut_path} for style {grade_style}")
+            # This will call our placeholder/mocked apply_lut
+            graded_image = apply_lut(image.copy(), lut_path)
+
+            # Basic check if image changed. More robust check might be needed if mock is subtle.
+            applied_successfully = image.tobytes() != graded_image.tobytes() if graded_image else False
+
+            return {
+                "graded_image": graded_image,
+                "grade_applied": grade_style if applied_successfully else None,
+                "lut_path": lut_path if applied_successfully else None,
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"Error applying cinematic LUT for style {grade_style}: {str(e)}")
+            return {"graded_image": image, "grade_applied": None, "error": str(e)}
+
+    def apply_ai_fabric_sharpening(self, image: Image.Image, intensity: float = 0.5) -> Dict[str, Any]:
+        logger.info("Applying AI smart sharpening to garment fabric.")
+        try:
+            # Potential: Could use garment mask here to apply sharpening only to garment.
+            # For now, applies to whole image for simplicity of mock.
+            sharpened_image = ai_smart_sharpen(image.copy(), intensity=intensity)
+            applied_successfully = image.tobytes() != sharpened_image.tobytes() if sharpened_image else False
+            return {
+                "processed_image": sharpened_image,
+                "operation": "ai_fabric_sharpen",
+                "intensity": intensity,
+                "success": applied_successfully
+            }
+        except Exception as e:
+            logger.error(f"Error during AI fabric sharpening: {str(e)}")
+            return {"processed_image": image, "operation": "ai_fabric_sharpen", "success": False, "error": str(e)}
+
+    def apply_ai_garment_denoising(self, image: Image.Image, strength: float = 0.5) -> Dict[str, Any]:
+        logger.info("Applying AI smart denoising to garment.")
+        try:
+            denoised_image = ai_smart_denoise(image.copy(), strength=strength)
+            applied_successfully = image.tobytes() != denoised_image.tobytes() if denoised_image else False
+            return {
+                "processed_image": denoised_image,
+                "operation": "ai_garment_denoise",
+                "strength": strength,
+                "success": applied_successfully
+            }
+        except Exception as e:
+            logger.error(f"Error during AI garment denoising: {str(e)}")
+            return {"processed_image": image, "operation": "ai_garment_denoise", "success": False, "error": str(e)}

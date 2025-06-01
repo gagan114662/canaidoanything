@@ -12,6 +12,7 @@ import threading
 from app.services.ai.model_enhancement_service import ModelEnhancementService
 from app.services.ai.garment_optimization_service import GarmentOptimizationService
 from app.services.ai.scene_generation_service import SceneGenerationService
+from app.services.ai.brand_consistency_service import BrandConsistencyService # Added
 from app.utils.image_utils import resize_image, enhance_image
 from app.core.config import settings
 
@@ -25,6 +26,7 @@ class ModelTransformationPipeline:
         self.model_enhancement_service = ModelEnhancementService()
         self.garment_optimization_service = GarmentOptimizationService()
         self.scene_generation_service = SceneGenerationService()
+        self.brand_consistency_service = BrandConsistencyService() # Added
         
         # Pipeline state
         self.services_loaded = False
@@ -127,7 +129,8 @@ class ModelTransformationPipeline:
                 futures = {
                     executor.submit(self.model_enhancement_service.load_models): "model_enhancement",
                     executor.submit(self.garment_optimization_service.load_models): "garment_optimization",
-                    executor.submit(self.scene_generation_service.load_models): "scene_generation"
+                    executor.submit(self.scene_generation_service.load_models): "scene_generation",
+                    executor.submit(self.brand_consistency_service.load_models): "brand_consistency" # Added
                 }
                 
                 for future in as_completed(futures):
@@ -159,7 +162,13 @@ class ModelTransformationPipeline:
         quality_mode: str = "balanced",  # "fast", "balanced", "high"
         seed: Optional[int] = None,
         composition_rule: Optional[str] = None,
-        controlnet_condition_image_path: Optional[str] = None
+        controlnet_condition_image_path: Optional[str] = None,
+        apply_brand_color_grade_lut: Optional[str] = None,
+        apply_cinematic_color_grade_style: Optional[str] = None,
+        use_ai_smart_sharpening: bool = False,
+        use_ai_smart_denoising: bool = False,
+        use_ai_detail_enhancement: bool = False,
+        request_composition_suggestion: bool = False
     ) -> Dict[str, Any]:
         """
         Transform model photo into professional photoshoot variations
@@ -174,8 +183,14 @@ class ModelTransformationPipeline:
             generate_scene: Whether to generate professional scenes
             quality_mode: Processing quality mode
             seed: Random seed for reproducibility
-            composition_rule: Optional composition rule to apply.
+            composition_rule: Optional composition rule to apply (used for crop suggestion or direct application).
             controlnet_condition_image_path: Optional path to ControlNet condition image.
+            apply_brand_color_grade_lut: Optional path/name of brand LUT.
+            apply_cinematic_color_grade_style: Optional cinematic color grade style name.
+            use_ai_smart_sharpening: bool to enable AI sharpening.
+            use_ai_smart_denoising: bool to enable AI denoising.
+            use_ai_detail_enhancement: bool to enable AI detail enhancement.
+            request_composition_suggestion: bool to request crop suggestion.
             
         Returns:
             Transformation results with variations and metadata
@@ -269,6 +284,66 @@ class ModelTransformationPipeline:
                     )
                 
                 variation_times = [v.get("processing_time", 0) for v in variations]
+
+            # Apply post-processing to each variation
+            for variation in variations:
+                processed_image = variation["variation_image"]
+                post_processing_applied_log = variation.get("post_processing_applied", [])
+
+                if apply_brand_color_grade_lut:
+                    logger.info(f"Applying brand LUT: {apply_brand_color_grade_lut} to variation {variation['style_type']}")
+                    grade_result = self.brand_consistency_service.apply_advanced_color_grade(processed_image, apply_brand_color_grade_lut)
+                    if grade_result["success"]: # Assuming success key, adjust to actual key from service
+                        processed_image = grade_result["graded_image"]
+                        post_processing_applied_log.append(f"brand_lut:{apply_brand_color_grade_lut}")
+                elif apply_cinematic_color_grade_style: # Exclusive with brand LUT for now
+                    logger.info(f"Applying cinematic LUT style: {apply_cinematic_color_grade_style} to variation {variation['style_type']}")
+                    grade_result = self.garment_optimization_service.apply_cinematic_color_grade(processed_image, apply_cinematic_color_grade_style)
+                    if grade_result.get("grade_applied"):
+                        processed_image = grade_result["graded_image"]
+                        post_processing_applied_log.append(f"cinematic_lut:{apply_cinematic_color_grade_style}")
+
+                if use_ai_smart_denoising:
+                    logger.info(f"Applying AI denoising to variation {variation['style_type']}")
+                    denoise_model_res = self.model_enhancement_service.apply_ai_denoising(processed_image, strength=0.5)
+                    if denoise_model_res["success"]:
+                        processed_image = denoise_model_res["processed_image"]
+                    denoise_garment_res = self.garment_optimization_service.apply_ai_garment_denoising(processed_image, strength=0.5)
+                    if denoise_garment_res["success"]:
+                        processed_image = denoise_garment_res["processed_image"]
+                    if denoise_model_res["success"] or denoise_garment_res["success"]:
+                        post_processing_applied_log.append("ai_denoise")
+
+                if use_ai_smart_sharpening:
+                    logger.info(f"Applying AI sharpening to variation {variation['style_type']}")
+                    sharpen_model_res = self.model_enhancement_service.apply_ai_sharpening(processed_image, intensity=0.5)
+                    if sharpen_model_res["success"]:
+                        processed_image = sharpen_model_res["processed_image"]
+                    sharpen_fabric_res = self.garment_optimization_service.apply_ai_fabric_sharpening(processed_image, intensity=0.5)
+                    if sharpen_fabric_res["success"]:
+                        processed_image = sharpen_fabric_res["processed_image"]
+                    if sharpen_model_res["success"] or sharpen_fabric_res["success"]:
+                        post_processing_applied_log.append("ai_sharpen")
+
+                if use_ai_detail_enhancement:
+                    logger.info(f"Applying AI detail enhancement to variation {variation['style_type']}")
+                    detail_model_res = self.model_enhancement_service.apply_ai_model_detail_enhancement(processed_image, face_intensity=0.5, accessory_intensity=0.5)
+                    if detail_model_res.get("face_enhanced") or detail_model_res.get("accessory_enhanced"):
+                         processed_image = detail_model_res["processed_image"]
+                    detail_fabric_res = self.garment_optimization_service.apply_ai_fabric_detail_enhancement(processed_image, intensity=0.5)
+                    if detail_fabric_res["success"]:
+                        processed_image = detail_fabric_res["processed_image"]
+                    if detail_model_res.get("face_enhanced") or detail_model_res.get("accessory_enhanced") or detail_fabric_res["success"]:
+                         post_processing_applied_log.append("ai_detail_enhance")
+
+                variation["variation_image"] = processed_image
+                variation["post_processing_applied"] = list(set(post_processing_applied_log)) # Ensure unique entries
+
+                if request_composition_suggestion:
+                    logger.info(f"Requesting composition suggestion for variation {variation['style_type']}")
+                    # Use the 'composition_rule' from the main method args for the suggestion
+                    suggestion = self.scene_generation_service.suggest_crop(processed_image, composition_rule)
+                    variation["suggested_crop_coordinates"] = suggestion
             
             # Calculate quality scores
             quality_scores = self._calculate_quality_scores(variations, stage_results)
@@ -913,6 +988,7 @@ class ModelTransformationPipeline:
             self.model_enhancement_service.clear_cache()
             self.garment_optimization_service.clear_cache()
             self.scene_generation_service.clear_cache()
+            self.brand_consistency_service.clear_cache() # Added
             
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -928,6 +1004,7 @@ class ModelTransformationPipeline:
             self.model_enhancement_service.unload_models()
             self.garment_optimization_service.unload_models()
             self.scene_generation_service.unload_models()
+            self.brand_consistency_service.unload_models() # Added
             
             self.services_loaded = False
             logger.info("All pipeline models unloaded")
